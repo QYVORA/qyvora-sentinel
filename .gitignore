@@ -1,0 +1,26 @@
+# Reports
+reports/*.html
+reports/*.json
+reports/*.md
+reports/*.txt
+!reports/.gitkeep
+
+# Logs
+*.log
+
+# Environment
+.env
+
+# Python
+node_modules/
+__pycache__/
+.cache/
+
+# Archives
+sentinel-*.tar.gz
+
+# Editor backups
+*.bak
+*.swp
+*.swo
+*~

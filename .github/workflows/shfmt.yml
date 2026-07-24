@@ -1,0 +1,32 @@
+name: shfmt
+
+on:
+  push:
+    paths:
+      - '**/*.sh'
+      - '**/*.bash'
+  pull_request:
+    paths:
+      - '**/*.sh'
+      - '**/*.bash'
+
+jobs:
+  shfmt:
+    name: shfmt Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install shfmt
+        run: |
+          SHFMT_VERSION="v3.7.0"
+          curl -sS "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64" -Lo /usr/local/bin/shfmt
+          chmod +x /usr/local/bin/shfmt
+
+      - name: Check formatting
+        run: |
+          if ! find . -name '*.sh' -o -name '*.bash' | xargs shfmt -d -i 4 -ci; then
+            echo "::error::Formatting issues found. Run 'shfmt -w -i 4 -ci' to fix."
+            exit 1
+          fi

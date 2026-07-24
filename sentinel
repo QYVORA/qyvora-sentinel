@@ -1,0 +1,1602 @@
+#!/usr/bin/env bash
+# sentinel - Main CLI entry point for QYVORA Sentinel
+# Linux Security Auditing Framework
+#
+# Usage: sentinel [global-options] <command> [command-options]
+#
+# Commands:
+#   scan        Run all enabled scan modules
+#   baseline    Create a baseline snapshot
+#   compare     Compare current state to last baseline
+#   modules     List all available modules
+#   report      Generate report from last scan results
+#   doctor      Check system dependencies and configuration
+#   version     Display version information
+#   update      Check for updates
+#   plugins     List/manage plugins
+#   help        Display help
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# Script location detection
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR}"
+
+# Detect installed vs development layout
+# Development: lib/, modules/ are siblings of the sentinel script
+# Installed:   binary in /usr/local/bin, data in /usr/local/share/sentinel/
+if [[ ! -d "${PROJECT_ROOT}/lib" && -d "/usr/local/share/sentinel/lib" ]]; then
+    PROJECT_ROOT="/usr/local/share/sentinel"
+fi
+
+# ---------------------------------------------------------------------------
+# Version information
+# ---------------------------------------------------------------------------
+readonly SENTINEL_VERSION="1.0.0"
+readonly SENTINEL_BUILD_DATE="2026-07-22"
+readonly SENTINEL_PRODUCT_NAME="QYVORA Sentinel"
+
+# ---------------------------------------------------------------------------
+# Global state arrays
+# ---------------------------------------------------------------------------
+declare -gA SENTINEL_CLI_ARGS=()
+declare -ga SENTINEL_MODULE_FILTERS=()
+declare -ga SENTINEL_EXCLUDE_FILTERS=()
+declare -ga SENTINEL_INCLUDE_FILTERS=()
+declare -ga SENTINEL_LOADED_MODULES=()
+declare -ga SENTINEL_FINDINGS=()
+declare -gA SENTINEL_FINDING_COUNTS=()
+declare -gA SENTINEL_MODULE_REGISTRY=()
+declare -g  SENTINEL_SCAN_START=""
+declare -g  SENTINEL_SCAN_END=""
+declare -g  SENTINEL_CURRENT_MODULE=""
+declare -g  SENTINEL_RISK_SCORE=0
+declare -g  SENTINEL_REPORT_DIR="${PROJECT_ROOT}/reports"
+declare -g  SENTINEL_BASELINE_DIR="${PROJECT_ROOT}/baselines"
+declare -g  SENTINEL_LAST_SCAN_FILE=""
+declare -g  SENTINEL_CONFIG_FILE_PATH=""
+declare -g  SENTINEL_REMAINING_ARGS=""
+
+# Config lookup order: /etc/sentinel -> PROJECT_ROOT/configs
+_sentinel_config_dir="/etc/sentinel"
+[[ ! -d "${_sentinel_config_dir}" ]] && _sentinel_config_dir="${PROJECT_ROOT}/configs"
+
+# Report/baseline dirs: prefer /var/log/sentinel when installed
+if [[ "${PROJECT_ROOT}" == "/usr/local/share/sentinel" ]]; then
+    SENTINEL_REPORT_DIR="/var/log/sentinel/reports"
+    SENTINEL_BASELINE_DIR="/var/log/sentinel/baselines"
+fi
+
+# ---------------------------------------------------------------------------
+# Source all library files (inlined to preserve global scope)
+# ---------------------------------------------------------------------------
+_SENTINEL_LIB_DIR="${PROJECT_ROOT}/lib"
+
+if [[ ! -d "${_SENTINEL_LIB_DIR}" ]]; then
+    echo "ERROR: Library directory not found: ${_SENTINEL_LIB_DIR}" >&2
+    exit 1
+fi
+
+# Temporarily disable errexit to tolerate readonly variable redefinition
+# between libs and source guard early-returns.
+set +e
+trap - ERR
+
+for _sentinel_lib_file in "${_SENTINEL_LIB_DIR}"/*.sh; do
+    if [[ -f "${_sentinel_lib_file}" ]]; then
+        # shellcheck disable=SC1090
+        source "${_sentinel_lib_file}" 2>/dev/null || true
+    fi
+done
+
+unset _sentinel_lib_file _SENTINEL_LIB_DIR
+
+set -eo pipefail
+
+# Reset shell options: lib files set -Eeuo pipefail which re-enables
+# errtrace. We need it OFF so that the ERR trap doesn't propagate into
+# functions where `|| true` guards are used.
+set +E
+
+# Initialize sentinel-specific globals AFTER sourcing libs,
+# so that lib files (e.g. baseline.sh) don't clobber our defaults.
+# (SENTINEL_REPORT_DIR and SENTINEL_BASELINE_DIR are set during path detection above)
+
+# ---------------------------------------------------------------------------
+# Trap / signal handling
+# ---------------------------------------------------------------------------
+_cleanup() {
+    local exit_code=$?
+    # Remove temp files if any
+    if [[ -d "${SENTINEL_TEMP_DIR:-}" ]]; then
+        rm -rf "${SENTINEL_TEMP_DIR}" 2>/dev/null || true
+    fi
+}
+
+_on_error() {
+    local line="${1:-unknown}"
+    local code="${2:-1}"
+    log_error "Unexpected error on line ${line} (exit code ${code})"
+    _cleanup
+    exit "${code}"
+}
+
+_on_signal() {
+    local signal="${1:-}"
+    log_warning "Received signal ${signal}, shutting down..."
+    _cleanup
+    exit 130
+}
+
+trap '_cleanup' EXIT
+trap '_on_error ${LINENO} $?' ERR
+trap '_on_signal HUP'  HUP
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+
+# Sentinel temp directory for this run
+SENTINEL_TEMP_DIR="$(mktemp -d -t "sentinel.XXXXXX" 2>/dev/null || mktemp -d)"
+
+# ---------------------------------------------------------------------------
+# Severity ordering for filtering
+# ---------------------------------------------------------------------------
+readonly -A SENTINEL_SEVERITY_ORDER=(
+    [INFO]=1
+    [LOW]=2
+    [MEDIUM]=3
+    [HIGH]=4
+    [CRITICAL]=5
+)
+
+_severity_meets_threshold() {
+    local -r finding_severity="${1^^}"
+    local -r threshold="${2^^}"
+    local f_val t_val
+
+    f_val="${SENTINEL_SEVERITY_ORDER[${finding_severity}]:-0}"
+    t_val="${SENTINEL_SEVERITY_ORDER[${threshold}]:-1}"
+
+    [[ "${f_val}" -ge "${t_val}" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Findings management - delegated to lib/reporting.sh add_finding()
+# ---------------------------------------------------------------------------
+
+_get_findings_json() {
+    local first=true
+    echo "["
+    for finding in "${SENTINEL_FINDINGS[@]+"${SENTINEL_FINDINGS[@]}"}"; do
+        IFS='|' read -r sev mod msg detail ts <<< "${finding}"
+        if [[ "${first}" == "true" ]]; then
+            first=false
+        else
+            echo ","
+        fi
+        printf '  {"severity":"%s","module":"%s","message":"%s","detail":"%s","timestamp":"%s"}' \
+            "${sev}" "${mod}" "${msg}" "${detail}" "${ts}"
+    done
+    echo ""
+    echo "]"
+}
+
+# ---------------------------------------------------------------------------
+# Global option parsing
+# ---------------------------------------------------------------------------
+parse_global_options() {
+    local args=("$@")
+    local i=0
+
+    SENTINEL_MODULE_FILTERS=()
+    SENTINEL_EXCLUDE_FILTERS=()
+    SENTINEL_INCLUDE_FILTERS=()
+
+    while [[ ${i} -lt ${#args[@]} ]]; do
+        local arg="${args[${i}]}"
+        case "${arg}" in
+            --json)
+                SENTINEL_CLI_ARGS[format]="json"
+                ;;
+            --html)
+                SENTINEL_CLI_ARGS[format]="html"
+                ;;
+            --markdown)
+                SENTINEL_CLI_ARGS[format]="markdown"
+                ;;
+            --text)
+                SENTINEL_CLI_ARGS[format]="text"
+                ;;
+            --quiet|-q)
+                SENTINEL_CLI_ARGS[quiet]="true"
+                ;;
+            --verbose|-v)
+                SENTINEL_CLI_ARGS[verbose]="true"
+                ;;
+            --debug)
+                SENTINEL_CLI_ARGS[debug]="true"
+                ;;
+            --color)
+                SENTINEL_CLI_ARGS[color]="true"
+                ;;
+            --no-color)
+                SENTINEL_CLI_ARGS[color]="false"
+                ;;
+            --output|-o)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_CLI_ARGS[output]="${args[${i}]}"
+                else
+                    echo "ERROR: --output requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --config|-c)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_CLI_ARGS[config]="${args[${i}]}"
+                else
+                    echo "ERROR: --config requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --severity|-s)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_CLI_ARGS[severity]="${args[${i}]}"
+                else
+                    echo "ERROR: --severity requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --module|-m)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_MODULE_FILTERS+=("${args[${i}]}")
+                else
+                    echo "ERROR: --module requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --exclude|-e)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_EXCLUDE_FILTERS+=("${args[${i}]}")
+                else
+                    echo "ERROR: --exclude requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --include|-I)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_INCLUDE_FILTERS+=("${args[${i}]}")
+                else
+                    echo "ERROR: --include requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --baseline|-b)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_CLI_ARGS[baseline]="${args[${i}]}"
+                else
+                    echo "ERROR: --baseline requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --compare)
+                SENTINEL_CLI_ARGS[compare]="true"
+                ;;
+            --threads|-t)
+                i=$((i + 1))
+                if [[ ${i} -lt ${#args[@]} ]]; then
+                    SENTINEL_CLI_ARGS[threads]="${args[${i}]}"
+                else
+                    echo "ERROR: --threads requires a value" >&2
+                    exit 1
+                fi
+                ;;
+            --risk-score)
+                SENTINEL_CLI_ARGS[risk_score]="true"
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            --version|-V)
+                cmd_version
+                exit 0
+                ;;
+            --)
+                i=$((i + 1))
+                break
+                ;;
+            -*)
+                echo "ERROR: Unknown option: ${arg}" >&2
+                echo "Run 'sentinel help' for usage information." >&2
+                exit 1
+                ;;
+            *)
+                # Non-option arg: skip (will be handled as subcommand/args later)
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    # Set defaults
+    SENTINEL_CLI_ARGS[format]="${SENTINEL_CLI_ARGS[format]:-text}"
+    SENTINEL_CLI_ARGS[quiet]="${SENTINEL_CLI_ARGS[quiet]:-false}"
+    SENTINEL_CLI_ARGS[verbose]="${SENTINEL_CLI_ARGS[verbose]:-false}"
+    SENTINEL_CLI_ARGS[debug]="${SENTINEL_CLI_ARGS[debug]:-false}"
+    SENTINEL_CLI_ARGS[color]="${SENTINEL_CLI_ARGS[color]:-auto}"
+    SENTINEL_CLI_ARGS[severity]="${SENTINEL_CLI_ARGS[severity]:-INFO}"
+    SENTINEL_CLI_ARGS[threads]="${SENTINEL_CLI_ARGS[threads]:-1}"
+    SENTINEL_CLI_ARGS[risk_score]="${SENTINEL_CLI_ARGS[risk_score]:-false}"
+    SENTINEL_CLI_ARGS[compare]="${SENTINEL_CLI_ARGS[compare]:-false}"
+
+    # Collect all non-option args as remaining args (subcommand + its args)
+    local non_option_args=()
+    for arg in "$@"; do
+        case "${arg}" in
+            -*) ;;
+            *) non_option_args+=("${arg}") ;;
+        esac
+    done
+    if [[ ${#non_option_args[@]} -gt 0 ]]; then
+        SENTINEL_REMAINING_ARGS="$(printf '%s\n' "${non_option_args[@]}")"
+    else
+        SENTINEL_REMAINING_ARGS=""
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Color / output mode setup
+# ---------------------------------------------------------------------------
+_setup_output_mode() {
+    # Color handling
+    if [[ "${SENTINEL_CLI_ARGS[color]}" == "false" ]]; then
+        export NO_COLOR=1
+        SENTINEL_COLOR_ENABLED=0
+    elif [[ "${SENTINEL_CLI_ARGS[color]}" == "true" ]]; then
+        unset NO_COLOR
+        SENTINEL_COLOR_ENABLED=1
+    fi
+
+    # Debug mode
+    if [[ "${SENTINEL_CLI_ARGS[debug]}" == "true" ]]; then
+        set -x
+        log_set_level "debug"
+    elif [[ "${SENTINEL_CLI_ARGS[verbose]}" == "true" ]]; then
+        log_set_level "debug"
+    elif [[ "${SENTINEL_CLI_ARGS[quiet]}" == "true" ]]; then
+        log_set_level "error"
+    fi
+
+    # Output file redirection
+    if [[ -n "${SENTINEL_CLI_ARGS[output]:-}" ]]; then
+        local outdir
+        outdir="$(dirname "${SENTINEL_CLI_ARGS[output]}")"
+        if [[ ! -d "${outdir}" ]]; then
+            mkdir -p "${outdir}"
+        fi
+    fi
+
+    # Ensure report directory exists
+    SENTINEL_REPORT_DIR="${SENTINEL_REPORT_DIR:-${PROJECT_ROOT}/reports}"
+    SENTINEL_BASELINE_DIR="${SENTINEL_BASELINE_DIR:-${PROJECT_ROOT}/baselines}"
+    mkdir -p "${SENTINEL_REPORT_DIR}" 2>/dev/null || true
+    mkdir -p "${SENTINEL_BASELINE_DIR}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+_validate_severity() {
+    local level="${1^^}"
+    case "${level}" in
+        INFO|LOW|MEDIUM|HIGH|CRITICAL)
+            return 0
+            ;;
+        *)
+            echo "ERROR: Invalid severity level: ${1}. Valid: INFO, LOW, MEDIUM, HIGH, CRITICAL" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Module discovery and loading
+# ---------------------------------------------------------------------------
+_discover_modules() {
+    local modules_dir="${PROJECT_ROOT}/modules"
+    local module_dir module_main
+
+    SENTINEL_MODULE_REGISTRY=()
+
+    if [[ ! -d "${modules_dir}" ]]; then
+        log_warning "Modules directory not found: ${modules_dir}"
+        return
+    fi
+
+    for module_dir in "${modules_dir}"/*/; do
+        [[ ! -d "${module_dir}" ]] && continue
+        module_main="${module_dir}main.sh"
+        if [[ -f "${module_main}" ]]; then
+            local mod_name
+            mod_name="$(basename "${module_dir}")"
+            SENTINEL_MODULE_REGISTRY["${mod_name}"]="${module_main}"
+        fi
+    done
+}
+
+_is_module_enabled() {
+    local -r module_name="${1}"
+
+    # If explicit --module filters are set, only those modules run
+    if [[ ${#SENTINEL_MODULE_FILTERS[@]} -gt 0 ]]; then
+        local filter
+        for filter in "${SENTINEL_MODULE_FILTERS[@]}"; do
+            if [[ "${module_name}" == "${filter}" ]]; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+
+    # Check --exclude filters
+    if [[ ${#SENTINEL_EXCLUDE_FILTERS[@]} -gt 0 ]]; then
+        local exclude
+        for exclude in "${SENTINEL_EXCLUDE_FILTERS[@]}"; do
+            if [[ "${module_name}" == "${exclude}" ]]; then
+                return 1
+            fi
+        done
+    fi
+
+    # Check --include filters (if set, only include listed modules)
+    if [[ ${#SENTINEL_INCLUDE_FILTERS[@]} -gt 0 ]]; then
+        local include
+        for include in "${SENTINEL_INCLUDE_FILTERS[@]}"; do
+            if [[ "${module_name}" == "${include}" ]]; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+
+    return 0
+}
+
+_load_module() {
+    local -r module_name="${1}"
+    local module_file="${SENTINEL_MODULE_REGISTRY[${module_name}]:-}"
+
+    if [[ -z "${module_file}" || ! -f "${module_file}" ]]; then
+        log_error "Module file not found: ${module_name}"
+        return 1
+    fi
+
+    # Reset module state variables before sourcing
+    # Remove readonly attribute first, then unset
+    declare +r MODULE_NAME 2>/dev/null || true
+    unset MODULE_NAME 2>/dev/null || true
+    declare +r MODULE_DESCRIPTION 2>/dev/null || true
+    unset MODULE_DESCRIPTION 2>/dev/null || true
+    declare +r MODULE_SEVERITY_THRESHOLD 2>/dev/null || true
+    unset MODULE_SEVERITY_THRESHOLD 2>/dev/null || true
+    declare +r MODULE_VERSION 2>/dev/null || true
+    unset MODULE_VERSION 2>/dev/null || true
+    unset -f run 2>/dev/null || true
+
+    # Source the module in a subshell-compatible way
+    # shellcheck disable=SC1090
+    source "${module_file}"
+
+    # Validate required exports
+    if [[ -z "${MODULE_NAME:-}" ]]; then
+        log_error "Module ${module_name} does not export MODULE_NAME"
+        return 1
+    fi
+
+    if ! declare -f run &>/dev/null; then
+        log_error "Module ${module_name} does not define a run() function"
+        return 1
+    fi
+
+    log_debug "Loaded module: ${MODULE_NAME:-${module_name}} (${MODULE_DESCRIPTION:-no description})"
+    return 0
+}
+
+_run_module() {
+    local -r module_name="${1}"
+    local module_start module_end module_duration
+
+    SENTINEL_CURRENT_MODULE="${module_name}"
+
+    if ! _is_module_enabled "${module_name}"; then
+        log_debug "Skipping disabled module: ${module_name}"
+        return 1
+    fi
+
+    if ! _load_module "${module_name}"; then
+        return 1
+    fi
+
+    local sev_threshold="${MODULE_SEVERITY_THRESHOLD:-INFO}"
+    if ! _severity_meets_threshold "${SENTINEL_CLI_ARGS[severity]}" "${sev_threshold}"; then
+        log_debug "Skipping module ${module_name} (threshold ${sev_threshold} > filter ${SENTINEL_CLI_ARGS[severity]})"
+        return 1
+    fi
+
+    if [[ "${SENTINEL_CLI_ARGS[quiet]:-false}" != "true" ]]; then
+        echo ""
+        print_subheader "Running: ${MODULE_NAME:-${module_name}} - ${MODULE_DESCRIPTION:-}"
+    fi
+
+    log_info "Starting module: ${MODULE_NAME:-${module_name}}"
+    module_start=$(date +%s)
+
+    local module_exit=0
+    run || module_exit=$?
+
+    module_end=$(date +%s)
+    module_duration=$(( module_end - module_start ))
+
+    if [[ "${module_exit}" -ne 0 ]]; then
+        log_warning "Module ${module_name} exited with code ${module_exit}"
+    else
+        log_info "Module ${module_name} completed in ${module_duration}s"
+    fi
+
+    SENTINEL_CURRENT_MODULE=""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Risk score calculation
+# ---------------------------------------------------------------------------
+_calculate_risk_score() {
+    local score=0
+    local critical="${SENTINEL_FINDING_COUNTS[CRITICAL]:-0}"
+    local high="${SENTINEL_FINDING_COUNTS[HIGH]:-0}"
+    local medium="${SENTINEL_FINDING_COUNTS[MEDIUM]:-0}"
+    local low="${SENTINEL_FINDING_COUNTS[LOW]:-0}"
+    local info="${SENTINEL_FINDING_COUNTS[INFO]:-0}"
+
+    score=$(( critical * 25 + high * 15 + medium * 8 + low * 3 + info * 1 ))
+
+    # Cap at 100
+    if [[ "${score}" -gt 100 ]]; then
+        score=100
+    fi
+
+    SENTINEL_RISK_SCORE="${score}"
+}
+
+# ---------------------------------------------------------------------------
+# Findings summary display
+# ---------------------------------------------------------------------------
+_print_scan_summary() {
+    local run_count="${1:-0}"
+    local total=0
+    local critical="${SENTINEL_FINDING_COUNTS[CRITICAL]:-0}"
+    local high="${SENTINEL_FINDING_COUNTS[HIGH]:-0}"
+    local medium="${SENTINEL_FINDING_COUNTS[MEDIUM]:-0}"
+    local low="${SENTINEL_FINDING_COUNTS[LOW]:-0}"
+    local info="${SENTINEL_FINDING_COUNTS[INFO]:-0}"
+
+    total=$(( critical + high + medium + low + info ))
+
+    echo ""
+    print_header "Scan Summary"
+
+    echo ""
+    print_separator
+    echo -e "  Total findings: ${SENTINEL_COLOR_BOLD}${total}${SENTINEL_COLOR_RESET}"
+    echo "  Modules run:    ${run_count}"
+    echo "  Scan duration:  $(( $(date +%s) - $(date -d "${SENTINEL_SCAN_START}" +%s 2>/dev/null || echo "$(date +%s)") ))s"
+
+    if [[ "${SENTINEL_CLI_ARGS[quiet]:-false}" != "true" ]]; then
+        echo ""
+        if [[ "${critical}" -gt 0 ]]; then
+            print_finding "CRITICAL" "Critical findings: ${critical}"
+        fi
+        if [[ "${high}" -gt 0 ]]; then
+            print_finding "HIGH" "High findings: ${high}"
+        fi
+        if [[ "${medium}" -gt 0 ]]; then
+            print_finding "MEDIUM" "Medium findings: ${medium}"
+        fi
+        if [[ "${low}" -gt 0 ]]; then
+            print_finding "LOW" "Low findings: ${low}"
+        fi
+        if [[ "${info}" -gt 0 ]]; then
+            print_finding "INFO" "Informational: ${info}"
+        fi
+    fi
+
+    if [[ "${SENTINEL_CLI_ARGS[risk_score]}" == "true" ]]; then
+        _calculate_risk_score
+        print_risk_score "${SENTINEL_RISK_SCORE}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Save scan results to file
+# ---------------------------------------------------------------------------
+_save_scan_results() {
+    local scan_file="${SENTINEL_REPORT_DIR}/scan-$(date -u '+%Y%m%dT%H%M%SZ').json"
+
+    if {
+        printf '{\n'
+        printf '  "version": "%s",\n' "${SENTINEL_VERSION}"
+        printf '  "timestamp": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '  "hostname": "%s",\n' "$(hostname 2>/dev/null || echo unknown)"
+        printf '  "user": "%s",\n' "$(whoami 2>/dev/null || echo unknown)"
+        printf '  "risk_score": %d,\n' "${SENTINEL_RISK_SCORE}"
+        printf '  "findings": '
+        _get_findings_json
+        printf '\n}\n'
+    } > "${scan_file}" 2>/dev/null; then
+        SENTINEL_LAST_SCAN_FILE="${scan_file}"
+        log_info "Scan results saved to ${scan_file}"
+    else
+        log_warning "Could not save scan results to ${scan_file} (permission denied?)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: scan
+# ---------------------------------------------------------------------------
+cmd_scan() {
+    local remaining_args=("$@")
+
+    # Parse scan-specific options from remaining args if any
+    # (module filters already parsed as global options)
+
+    SENTINEL_SCAN_START="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    if [[ "${SENTINEL_CLI_ARGS[quiet]:-false}" != "true" ]]; then
+        print_banner
+        echo ""
+        echo "  Scan started:  ${SENTINEL_SCAN_START}"
+        echo "  Hostname:      $(hostname 2>/dev/null || echo unknown)"
+        echo "  User:          $(whoami 2>/dev/null || echo unknown)"
+        echo "  Severity:      ${SENTINEL_CLI_ARGS[severity]}"
+        echo "  Output format: ${SENTINEL_CLI_ARGS[format]}"
+    fi
+
+    # Initialize subsystems
+    log_info "Initializing subsystems..."
+
+    local config_file="${SENTINEL_CLI_ARGS[config]:-}"
+    if [[ -n "${config_file}" ]]; then
+        if [[ -f "${config_file}" ]]; then
+            config_init "${config_file}"
+        else
+            log_error "Config file not found: ${config_file}"
+            exit 1
+        fi
+    else
+        config_init 2>/dev/null || true
+    fi
+
+    log_info "Discovering modules..."
+    _discover_modules
+
+    local total_modules=${#SENTINEL_MODULE_REGISTRY[@]}
+    if [[ "${total_modules}" -eq 0 ]]; then
+        log_warning "No modules found in ${PROJECT_ROOT}/modules/"
+        log_info "Create modules with a main.sh file in modules/<name>/main.sh"
+        return 0
+    fi
+
+    log_info "Found ${total_modules} module(s)"
+
+    # Run modules
+    local module_name
+    local modules_run=0
+    local modules_skipped=0
+    for module_name in $(echo "${!SENTINEL_MODULE_REGISTRY[@]}" | tr ' ' '\n' | sort); do
+        SENTINEL_LOADED_MODULES+=("${module_name}")
+        if _run_module "${module_name}"; then
+            modules_run=$((modules_run + 1))
+        else
+            modules_skipped=$((modules_skipped + 1))
+        fi
+
+        # Progress indicator
+        if [[ "${SENTINEL_CLI_ARGS[quiet]:-false}" != "true" && ${total_modules} -gt 1 ]]; then
+            print_progress "$((modules_run + modules_skipped))" "${total_modules}" "${module_name}"
+        fi
+    done
+
+    SENTINEL_SCAN_END="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    # Calculate final risk score
+    _calculate_risk_score
+
+    # Display summary
+    _print_scan_summary "${modules_run}"
+
+    # Save results
+    _save_scan_results
+
+    # Generate report if requested
+    local format="${SENTINEL_CLI_ARGS[format]}"
+    if [[ "${format}" != "text" ]]; then
+        _generate_report "${format}"
+    fi
+
+    # Generate report to file if --output specified
+    if [[ -n "${SENTINEL_CLI_ARGS[output]:-}" ]]; then
+        _generate_report_to_file "${SENTINEL_CLI_ARGS[output]}" "${format}"
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: baseline
+# ---------------------------------------------------------------------------
+cmd_baseline() {
+    local baseline_name="${1:-default}"
+    local baseline_file="${SENTINEL_BASELINE_DIR}/${baseline_name}.baseline"
+
+    mkdir -p "${SENTINEL_BASELINE_DIR}"
+
+    print_header "Creating Baseline Snapshot"
+    echo ""
+    echo "  Name:     ${baseline_name}"
+    echo "  File:     ${baseline_file}"
+    echo "  Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo ""
+
+    local baseline_data="${SENTINEL_TEMP_DIR}/baseline"
+    mkdir -p "${baseline_data}"
+
+    log_info "Collecting system state for baseline..."
+
+    # Filesystem state
+    log_info "Recording SUID files..."
+    find /usr /bin /sbin -xdev -type f -perm -4000 2>/dev/null \
+        | sort > "${baseline_data}/suid_files.txt" || true
+
+    log_info "Recording SGID files..."
+    find /usr /bin /sbin -xdev -type f -perm -2000 2>/dev/null \
+        | sort > "${baseline_data}/sgid_files.txt" || true
+
+    log_info "Recording world-writable files..."
+    find /etc /usr /var -xdev \( -type f -o -type d \) -perm -0002 2>/dev/null \
+        | sort > "${baseline_data}/world_writable.txt" || true
+
+    # Installed packages
+    log_info "Recording installed packages..."
+    if command_exists dpkg; then
+        dpkg -l 2>/dev/null | awk '/^ii/ {print $2, $3}' | sort > "${baseline_data}/packages.txt" || true
+    elif command_exists rpm; then
+        rpm -qa --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | sort > "${baseline_data}/packages.txt" || true
+    fi
+
+    # Running services
+    log_info "Recording running services..."
+    if command_exists systemctl; then
+        systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
+            | awk '{print $1}' | sort > "${baseline_data}/services.txt" || true
+    fi
+
+    # Listening ports
+    log_info "Recording listening ports..."
+    if command_exists ss; then
+        ss -tulnp 2>/dev/null | sort > "${baseline_data}/listening_ports.txt" || true
+    elif command_exists netstat; then
+        netstat -tulnp 2>/dev/null | sort > "${baseline_data}/listening_ports.txt" || true
+    fi
+
+    # Users with login shells
+    log_info "Recording user accounts..."
+    awk -F: '$7 !~ /(nologin|false|sync|shutdown|halt)/ {print $1, $3, $6, $7}' /etc/passwd 2>/dev/null \
+        | sort > "${baseline_data}/users.txt" || true
+
+    # Crontabs
+    log_info "Recording crontabs..."
+    {
+        for user_dir in /var/spool/cron/crontabs/*; do
+            [[ -f "${user_dir}" ]] && cat "${user_dir}" 2>/dev/null
+        done
+        cat /etc/crontab 2>/dev/null
+        ls /etc/cron.d/ 2>/dev/null | while read -r f; do cat "/etc/cron.d/${f}" 2>/dev/null; done
+    } | sort -u > "${baseline_data}/crontabs.txt" || true
+
+    # Kernel modules
+    log_info "Recording kernel modules..."
+    lsmod 2>/dev/null | awk 'NR>1 {print $1}' | sort > "${baseline_data}/kernel_modules.txt" || true
+
+    # Hash critical config files
+    log_info "Hashing critical configuration files..."
+    {
+        for conf_file in /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/ssh/sshd_config; do
+            if [[ -f "${conf_file}" ]]; then
+                hash_sha256 "${conf_file}" 2>/dev/null && printf "  %s\n" "${conf_file}" || true
+            fi
+        done
+    } > "${baseline_data}/config_hashes.txt" || true
+
+    # Create the baseline archive
+    log_info "Creating baseline archive..."
+    local manifest="${baseline_data}/manifest.txt"
+    {
+        printf '# QYVORA Sentinel Baseline\n'
+        printf '# Created: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '# Hostname: %s\n' "$(hostname 2>/dev/null || echo unknown)"
+        printf '# User: %s\n' "$(whoami 2>/dev/null || echo unknown)"
+        printf '#\n'
+        for f in "${baseline_data}"/*.txt; do
+            [[ -f "${f}" ]] || continue
+            local fname
+            fname="$(basename "${f}")"
+            local fhash
+            fhash="$(sha256sum "${f}" 2>/dev/null | awk '{print $1}')"
+            local fcount
+            fcount="$(wc -l < "${f}" 2>/dev/null || echo 0)"
+            printf '%s %s %s\n' "${fhash}" "${fcount}" "${fname}"
+        done
+    } > "${manifest}"
+
+    # Pack everything into the baseline file
+    tar czf "${baseline_file}" -C "${baseline_data}" . 2>/dev/null
+
+    echo ""
+    print_success "Baseline saved: ${baseline_file}"
+    echo "  Files tracked: $(ls -1 "${baseline_data}"/*.txt 2>/dev/null | wc -l)"
+    echo "  Size: $(du -h "${baseline_file}" 2>/dev/null | awk '{print $1}')"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: compare
+# ---------------------------------------------------------------------------
+cmd_compare() {
+    local baseline_name="${SENTINEL_CLI_ARGS[baseline]:-default}"
+    local baseline_file="${SENTINEL_BASELINE_DIR}/${baseline_name}.baseline"
+
+    print_header "Comparing Current State to Baseline"
+    echo ""
+    echo "  Baseline: ${baseline_name}"
+    echo ""
+
+    if [[ ! -f "${baseline_file}" ]]; then
+        log_error "Baseline not found: ${baseline_file}"
+        log_info "Run 'sentinel baseline ${baseline_name}' to create one first."
+        return 1
+    fi
+
+    local extract_dir="${SENTINEL_TEMP_DIR}/baseline_compare"
+    mkdir -p "${extract_dir}"
+    tar xzf "${baseline_file}" -C "${extract_dir}" 2>/dev/null
+
+    local changes_found=0
+
+    # Compare SUID files
+    if [[ -f "${extract_dir}/suid_files.txt" ]]; then
+        local current_suid="${SENTINEL_TEMP_DIR}/current_suid.txt"
+        find /usr /bin /sbin -xdev -type f -perm -4000 2>/dev/null | sort > "${current_suid}" || true
+
+        local added removed
+        added="$(comm -13 "${extract_dir}/suid_files.txt" "${current_suid}" 2>/dev/null || true)"
+        removed="$(comm -23 "${extract_dir}/suid_files.txt" "${current_suid}" 2>/dev/null || true)"
+
+        if [[ -n "${added}" ]]; then
+            echo -e "${SENTINEL_COLOR_RED}${SENTINEL_CROSSMARK} New SUID files detected:${SENTINEL_COLOR_RESET}"
+            echo "${added}" | while IFS= read -r f; do
+                echo "    + ${f}"
+                add_finding "compare" "New SUID file: ${f}" "high"
+            done
+            changes_found=1
+        fi
+        if [[ -n "${removed}" ]]; then
+            echo -e "${SENTINEL_COLOR_YELLOW}${SENTINEL_WARNING} Removed SUID files:${SENTINEL_COLOR_RESET}"
+            echo "${removed}" | while IFS= read -r f; do
+                echo "    - ${f}"
+                add_finding "compare" "Removed SUID file: ${f}" "info"
+            done
+            changes_found=1
+        fi
+    fi
+
+    # Compare packages
+    if [[ -f "${extract_dir}/packages.txt" ]]; then
+        local current_pkgs="${SENTINEL_TEMP_DIR}/current_packages.txt"
+        if command_exists dpkg; then
+            dpkg -l 2>/dev/null | awk '/^ii/ {print $2, $3}' | sort > "${current_pkgs}" || true
+        elif command_exists rpm; then
+            rpm -qa --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' 2>/dev/null | sort > "${current_pkgs}" || true
+        fi
+
+        if [[ -f "${current_pkgs}" ]]; then
+            local added_pkgs removed_pkgs
+            added_pkgs="$(comm -13 "${extract_dir}/packages.txt" "${current_pkgs}" 2>/dev/null | wc -l)"
+            removed_pkgs="$(comm -23 "${extract_dir}/packages.txt" "${current_pkgs}" 2>/dev/null | wc -l)"
+
+            if [[ "${added_pkgs}" -gt 0 ]]; then
+                echo -e "${SENTINEL_COLOR_YELLOW}${SENTINEL_WARNING} ${added_pkgs} new package(s) installed${SENTINEL_COLOR_RESET}"
+                add_finding "compare" "${added_pkgs} new packages since baseline" "info"
+                changes_found=1
+            fi
+            if [[ "${removed_pkgs}" -gt 0 ]]; then
+                echo -e "${SENTINEL_COLOR_YELLOW}${SENTINEL_WARNING} ${removed_pkgs} package(s) removed${SENTINEL_COLOR_RESET}"
+                add_finding "compare" "${removed_pkgs} packages removed since baseline" "info"
+                changes_found=1
+            fi
+        fi
+    fi
+
+    # Compare listening ports
+    if [[ -f "${extract_dir}/listening_ports.txt" ]]; then
+        local current_ports="${SENTINEL_TEMP_DIR}/current_ports.txt"
+        if command_exists ss; then
+            ss -tulnp 2>/dev/null | sort > "${current_ports}" || true
+        elif command_exists netstat; then
+            netstat -tulnp 2>/dev/null | sort > "${current_ports}" || true
+        fi
+
+        if [[ -f "${current_ports}" ]]; then
+            local port_diff
+            port_diff="$(diff "${extract_dir}/listening_ports.txt" "${current_ports}" 2>/dev/null || true)"
+            if [[ -n "${port_diff}" ]]; then
+                echo -e "${SENTINEL_COLOR_YELLOW}${SENTINEL_WARNING} Listening ports changed${SENTINEL_COLOR_RESET}"
+                add_finding "compare" "Listening ports changed since baseline" "medium"
+                changes_found=1
+            fi
+        fi
+    fi
+
+    # Compare users
+    if [[ -f "${extract_dir}/users.txt" ]]; then
+        local current_users="${SENTINEL_TEMP_DIR}/current_users.txt"
+        awk -F: '$7 !~ /(nologin|false|sync|shutdown|halt)/ {print $1, $3, $6, $7}' /etc/passwd 2>/dev/null \
+            | sort > "${current_users}" || true
+
+        if [[ -f "${current_users}" ]]; then
+            local added_users removed_users
+            added_users="$(comm -13 "${extract_dir}/users.txt" "${current_users}" 2>/dev/null || true)"
+            removed_users="$(comm -23 "${extract_dir}/users.txt" "${current_users}" 2>/dev/null || true)"
+
+            if [[ -n "${added_users}" ]]; then
+                echo -e "${SENTINEL_COLOR_YELLOW}${SENTINEL_WARNING} New user accounts:${SENTINEL_COLOR_RESET}"
+                echo "${added_users}" | while IFS= read -r u; do
+                    echo "    + ${u}"
+                    add_finding "compare" "New user account: ${u}" "medium"
+                done
+                changes_found=1
+            fi
+            if [[ -n "${removed_users}" ]]; then
+                echo -e "${SENTINEL_COLOR_YELLOW}${SENTINEL_WARNING} Removed user accounts:${SENTINEL_COLOR_RESET}"
+                echo "${removed_users}" | while IFS= read -r u; do
+                    echo "    - ${u}"
+                    add_finding "compare" "Removed user account: ${u}" "info"
+                done
+                changes_found=1
+            fi
+        fi
+    fi
+
+    if [[ "${changes_found}" -eq 0 ]]; then
+        echo ""
+        print_success "No changes detected since baseline '${baseline_name}'"
+    else
+        echo ""
+        print_warning "Changes detected. Review findings above."
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: modules
+# ---------------------------------------------------------------------------
+cmd_modules() {
+    _discover_modules
+
+    print_header "Available Modules"
+
+    if [[ ${#SENTINEL_MODULE_REGISTRY[@]} -eq 0 ]]; then
+        echo ""
+        echo "  No modules found."
+        echo ""
+        echo "  Modules should be placed in: ${PROJECT_ROOT}/modules/<name>/main.sh"
+        echo ""
+        echo "  Each main.sh must export:"
+        echo "    MODULE_NAME=<name>"
+        echo "    MODULE_DESCRIPTION=<description>"
+        echo "    MODULE_SEVERITY_THRESHOLD=<INFO|LOW|MEDIUM|HIGH|CRITICAL>"
+        echo "    run() { ... }"
+        return 0
+    fi
+
+    echo ""
+    printf "  ${SENTINEL_COLOR_BOLD}%-20s %-45s %s${SENTINEL_COLOR_RESET}\n" "NAME" "DESCRIPTION" "STATUS"
+    printf "  ${SENTINEL_COLOR_CYAN}%-20s %-45s %s${SENTINEL_COLOR_RESET}\n" "────────────────────" "─────────────────────────────────────────────" "──────────"
+
+    local module_name
+    local total=0
+    local enabled=0
+
+    for module_name in $(echo "${!SENTINEL_MODULE_REGISTRY[@]}" | tr ' ' '\n' | sort); do
+        total=$((total + 1))
+        local module_file="${SENTINEL_MODULE_REGISTRY[${module_name}]}"
+        local desc=""
+        local status="enabled"
+        local status_color="${SENTINEL_COLOR_GREEN}"
+
+        # Try to read description from the module file
+        if [[ -f "${module_file}" ]]; then
+            desc="$(grep -E '^(readonly )?MODULE_DESCRIPTION=' "${module_file}" 2>/dev/null | head -1 | sed 's/^readonly //' | cut -d= -f2- | tr -d '"' || true)"
+        fi
+
+        if _is_module_enabled "${module_name}"; then
+            enabled=$((enabled + 1))
+        else
+            status="disabled"
+            status_color="${SENTINEL_COLOR_RED}"
+        fi
+
+        printf "  %-20s %-45s ${status_color}%s${SENTINEL_COLOR_RESET}\n" "${module_name}" "${desc:-No description}" "${status}"
+    done
+
+    echo ""
+    echo "  Total: ${total} | Enabled: ${enabled} | Disabled: $((total - enabled))"
+    echo ""
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: report
+# ---------------------------------------------------------------------------
+_generate_report() {
+    local format="${1:-text}"
+
+    if [[ ${#SENTINEL_FINDINGS[@]} -eq 0 ]]; then
+        log_warning "No findings to report"
+        return 0
+    fi
+
+    case "${format}" in
+        json)
+            _get_findings_json
+            ;;
+        markdown|md)
+            echo "# QYVORA Sentinel Scan Report"
+            echo ""
+            echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "**Hostname:** $(hostname 2>/dev/null || echo unknown)"
+            echo "**Risk Score:** ${SENTINEL_RISK_SCORE}/100"
+            echo ""
+            echo "## Findings Summary"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            echo "| CRITICAL | ${SENTINEL_FINDING_COUNTS[CRITICAL]:-0} |"
+            echo "| HIGH     | ${SENTINEL_FINDING_COUNTS[HIGH]:-0} |"
+            echo "| MEDIUM   | ${SENTINEL_FINDING_COUNTS[MEDIUM]:-0} |"
+            echo "| LOW      | ${SENTINEL_FINDING_COUNTS[LOW]:-0} |"
+            echo "| INFO     | ${SENTINEL_FINDING_COUNTS[INFO]:-0} |"
+            echo ""
+            echo "## Findings"
+            echo ""
+            for finding in "${SENTINEL_FINDINGS[@]+"${SENTINEL_FINDINGS[@]}"}"; do
+                IFS='|' read -r sev mod msg detail ts <<< "${finding}"
+                echo "- **[${sev}]** (${mod}) ${msg}"
+                if [[ -n "${detail}" ]]; then
+                    echo "  - ${detail}"
+                fi
+            done
+            ;;
+        html)
+            cat <<HTMLEOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QYVORA Sentinel Report</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:2rem;background:#0d1117;color:#c9d1d9}
+h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:.5rem}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #30363d;padding:.5rem 1rem;text-align:left}
+th{background:#161b22}
+.critical{color:#f85149}.high{color:#f85149}.medium{color:#d29922}.low{color:#a371f7}.info{color:#8b949e}
+.finding{margin:.5rem 0;padding:.5rem 1rem;border-left:3px solid #30363d;background:#161b22}
+.risk{font-size:1.5rem;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>QYVORA Sentinel Scan Report</h1>
+<p><strong>Date:</strong> $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+<strong>Hostname:</strong> $(hostname 2>/dev/null || echo unknown) |
+<strong>Risk Score:</strong> <span class="risk">${SENTINEL_RISK_SCORE}/100</span></p>
+<h2>Summary</h2>
+<table>
+<tr><th>Severity</th><th>Count</th></tr>
+<tr><td class="critical">CRITICAL</td><td>${SENTINEL_FINDING_COUNTS[CRITICAL]:-0}</td></tr>
+<tr><td class="high">HIGH</td><td>${SENTINEL_FINDING_COUNTS[HIGH]:-0}</td></tr>
+<tr><td class="medium">MEDIUM</td><td>${SENTINEL_FINDING_COUNTS[MEDIUM]:-0}</td></tr>
+<tr><td class="low">LOW</td><td>${SENTINEL_FINDING_COUNTS[LOW]:-0}</td></tr>
+<tr><td class="info">INFO</td><td>${SENTINEL_FINDING_COUNTS[INFO]:-0}</td></tr>
+</table>
+<h2>Findings</h2>
+HTMLEOF
+            for finding in "${SENTINEL_FINDINGS[@]+"${SENTINEL_FINDINGS[@]}"}"; do
+                IFS='|' read -r sev mod msg detail ts <<< "${finding}"
+                local sev_lower="${sev,,}"
+                printf '<div class="finding"><strong class="%s">[%s]</strong> <em>(%s)</em> %s' \
+                    "${sev_lower}" "${sev}" "${mod}" "${msg}"
+                if [[ -n "${detail}" ]]; then
+                    printf '<br><small>%s</small>' "${detail}"
+                fi
+                printf '</div>\n'
+            done
+            cat <<'HTMLEOF2'
+</body>
+</html>
+HTMLEOF2
+            ;;
+        text|*)
+            echo "QYVORA Sentinel Scan Report"
+            echo "============================"
+            echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Hostname: $(hostname 2>/dev/null || echo unknown)"
+            echo "Risk Score: ${SENTINEL_RISK_SCORE}/100"
+            echo ""
+            for finding in "${SENTINEL_FINDINGS[@]+"${SENTINEL_FINDINGS[@]}"}"; do
+                IFS='|' read -r sev mod msg detail ts <<< "${finding}"
+                printf '[%s] [%s] %s\n' "${sev}" "${mod}" "${msg}"
+                if [[ -n "${detail}" ]]; then
+                    printf '  -> %s\n' "${detail}"
+                fi
+            done
+            ;;
+    esac
+}
+
+_generate_report_to_file() {
+    local -r filepath="${1}"
+    local -r format="${2:-text}"
+
+    log_info "Writing ${format} report to ${filepath}"
+    _generate_report "${format}" > "${filepath}"
+    print_success "Report written to ${filepath}"
+}
+
+cmd_report() {
+    local format="${SENTINEL_CLI_ARGS[format]:-text}"
+
+    # Try to load the last scan file if no findings in memory
+    if [[ ${#SENTINEL_FINDINGS[@]} -eq 0 ]]; then
+        local latest_scan
+        latest_scan="$(ls -t "${SENTINEL_REPORT_DIR}"/scan-*.json 2>/dev/null | head -1 || true)"
+        if [[ -n "${latest_scan}" ]]; then
+            log_info "Loading findings from ${latest_scan}"
+            SENTINEL_LAST_SCAN_FILE="${latest_scan}"
+        else
+            log_error "No scan results found. Run 'sentinel scan' first."
+            return 1
+        fi
+    fi
+
+    print_header "Generating Report"
+
+    if [[ -n "${SENTINEL_CLI_ARGS[output]:-}" ]]; then
+        _generate_report_to_file "${SENTINEL_CLI_ARGS[output]}" "${format}"
+    else
+        _generate_report "${format}"
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: doctor
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+    print_header "System Doctor"
+    echo ""
+
+    local errors=0
+    local warnings=0
+
+    # Required commands
+    echo "  ${SENTINEL_COLOR_BOLD}Required Commands:${SENTINEL_COLOR_RESET}"
+    local required_commands=(bash find ps cat grep awk sed chmod chown id whoami uname ls file stat)
+    local cmd
+    for cmd in "${required_commands[@]}"; do
+        if command_exists "${cmd}"; then
+            print_success "${cmd}: $(command -v "${cmd}")"
+        else
+            print_error "${cmd}: NOT FOUND"
+            errors=$((errors + 1))
+        fi
+    done
+
+    # At least one of ss/netstat
+    echo ""
+    echo "  ${SENTINEL_COLOR_BOLD}Network Commands:${SENTINEL_COLOR_RESET}"
+    if command_exists ss; then
+        print_success "ss: $(command -v ss)"
+    elif command_exists netstat; then
+        print_success "netstat: $(command -v netstat)"
+    else
+        print_error "ss/netstat: NEITHER FOUND"
+        errors=$((errors + 1))
+    fi
+
+    # Hash commands
+    echo ""
+    echo "  ${SENTINEL_COLOR_BOLD}Hash Commands:${SENTINEL_COLOR_RESET}"
+    if command_exists sha256sum; then
+        print_success "sha256sum: $(command -v sha256sum)"
+    elif command_exists shasum; then
+        print_success "shasum: $(command -v shasum)"
+    else
+        print_warning "sha256sum/shasum: NOT FOUND (optional but recommended)"
+        warnings=$((warnings + 1))
+    fi
+
+    if command_exists md5sum; then
+        print_success "md5sum: $(command -v md5sum)"
+    else
+        print_warning "md5sum: NOT FOUND (optional)"
+        warnings=$((warnings + 1))
+    fi
+
+    # Optional commands
+    echo ""
+    echo "  ${SENTINEL_COLOR_BOLD}Optional Commands:${SENTINEL_COLOR_RESET}"
+    local optional_commands=(docker kubectl systemctl journalctl iptables nftables ufw fail2ban-client)
+    for cmd in "${optional_commands[@]}"; do
+        if command_exists "${cmd}"; then
+            print_success "${cmd}: $(command -v "${cmd}")"
+        else
+            print_info "${cmd}: not installed (optional)"
+        fi
+    done
+
+    # Configuration
+    echo ""
+    echo "  ${SENTINEL_COLOR_BOLD}Configuration:${SENTINEL_COLOR_RESET}"
+    local config_file="${SENTINEL_CLI_ARGS[config]:-}"
+    if [[ -n "${config_file}" ]]; then
+        if [[ -f "${config_file}" ]]; then
+            print_success "Config file: ${config_file}"
+        else
+            print_error "Config file not found: ${config_file}"
+            errors=$((errors + 1))
+        fi
+    else
+        local default_config="${XDG_CONFIG_HOME:-${HOME}/.config}/qyvora-sentinel/sentinel.conf"
+        if [[ -f "${default_config}" ]]; then
+            print_success "Config file: ${default_config}"
+        else
+            print_info "No config file found (using defaults)"
+        fi
+    fi
+
+    # Report directory
+    echo ""
+    echo "  ${SENTINEL_COLOR_BOLD}Directories:${SENTINEL_COLOR_RESET}"
+    if [[ -d "${SENTINEL_REPORT_DIR}" ]] && [[ -w "${SENTINEL_REPORT_DIR}" ]]; then
+        print_success "Report directory: ${SENTINEL_REPORT_DIR} (writable)"
+    elif [[ -d "${SENTINEL_REPORT_DIR}" ]]; then
+        print_error "Report directory: ${SENTINEL_REPORT_DIR} (NOT WRITABLE)"
+        errors=$((errors + 1))
+    else
+        print_warning "Report directory: ${SENTINEL_REPORT_DIR} (will be created)"
+        warnings=$((warnings + 1))
+    fi
+
+    if [[ -d "${SENTINEL_BASELINE_DIR}" ]]; then
+        print_success "Baseline directory: ${SENTINEL_BASELINE_DIR}"
+    else
+        print_warning "Baseline directory: ${SENTINEL_BASELINE_DIR} (will be created)"
+        warnings=$((warnings + 1))
+    fi
+
+    # Modules
+    echo ""
+    echo "  ${SENTINEL_COLOR_BOLD}Modules:${SENTINEL_COLOR_RESET}"
+    _discover_modules
+    local module_count=${#SENTINEL_MODULE_REGISTRY[@]}
+    if [[ "${module_count}" -gt 0 ]]; then
+        print_success "${module_count} module(s) found"
+    else
+        print_warning "No modules found"
+        warnings=$((warnings + 1))
+    fi
+
+    # Summary
+    echo ""
+    print_separator
+    if [[ "${errors}" -gt 0 ]]; then
+        echo -e "  ${SENTINEL_COLOR_RED}${SENTINEL_COLOR_BOLD}Doctor found ${errors} error(s) and ${warnings} warning(s)${SENTINEL_COLOR_RESET}"
+        return 1
+    elif [[ "${warnings}" -gt 0 ]]; then
+        echo -e "  ${SENTINEL_COLOR_YELLOW}Doctor found ${warnings} warning(s) - system is functional${SENTINEL_COLOR_RESET}"
+        return 0
+    else
+        echo -e "  ${SENTINEL_COLOR_GREEN}${SENTINEL_COLOR_BOLD}System looks healthy!${SENTINEL_COLOR_RESET}"
+        return 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: version
+# ---------------------------------------------------------------------------
+cmd_version() {
+    echo "${SENTINEL_PRODUCT_NAME} v${SENTINEL_VERSION} (${SENTINEL_BUILD_DATE})"
+    echo ""
+    echo "  Bash version:   ${BASH_VERSION}"
+    echo "  Platform:       $(uname -s) $(uname -r)"
+    echo "  Architecture:   $(uname -m)"
+    echo "  OS:             $(get_os 2>/dev/null || echo unknown)"
+    echo "  Hostname:       $(hostname 2>/dev/null || echo unknown)"
+    echo "  Install path:   ${PROJECT_ROOT}"
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: update
+# ---------------------------------------------------------------------------
+cmd_update() {
+    print_header "Checking for Updates"
+    echo ""
+
+    echo "  Current version: ${SENTINEL_VERSION}"
+    echo "  Build date:      ${SENTINEL_BUILD_DATE}"
+    echo ""
+
+    # Check if we're in a git repo
+    if [[ -d "${PROJECT_ROOT}/.git" ]]; then
+        local remote_url current_branch
+        remote_url="$(git -C "${PROJECT_ROOT}" remote get-url origin 2>/dev/null || echo "")"
+        current_branch="$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+        if [[ -n "${remote_url}" ]]; then
+            echo "  Repository: ${remote_url}"
+            echo "  Branch:     ${current_branch}"
+            echo ""
+
+            log_info "Fetching latest changes..."
+            if git -C "${PROJECT_ROOT}" fetch origin 2>/dev/null; then
+                local local_hash remote_hash
+                local_hash="$(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo "")"
+                remote_hash="$(git -C "${PROJECT_ROOT}" rev-parse "origin/${current_branch}" 2>/dev/null || echo "")"
+
+                if [[ "${local_hash}" == "${remote_hash}" ]]; then
+                    print_success "Already up to date!"
+                elif [[ -n "${remote_hash}" ]]; then
+                    local behind
+                    behind="$(git -C "${PROJECT_ROOT}" rev-list HEAD.."origin/${current_branch}" --count 2>/dev/null || echo "?")"
+                    print_warning "Update available: ${behind} commit(s) behind"
+                    echo ""
+                    echo "  To update, run:"
+                    echo "    cd ${PROJECT_ROOT}"
+                    echo "    git pull origin ${current_branch}"
+                fi
+            else
+                print_warning "Could not fetch from remote"
+            fi
+        else
+            print_info "No remote configured. Cannot check for updates."
+        fi
+    else
+        print_info "Not a git repository. Cannot check for updates automatically."
+        echo ""
+        echo "  Visit https://github.com/qyvora/sentinel for the latest version."
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: plugins
+# ---------------------------------------------------------------------------
+cmd_plugins() {
+    local plugins_dir="${PROJECT_ROOT}/plugins"
+
+    print_header "Plugins"
+    echo ""
+
+    if [[ ! -d "${plugins_dir}" ]]; then
+        echo "  Plugins directory not found."
+        echo ""
+        echo "  Plugins can be placed in: ${plugins_dir}/"
+        echo "  Each plugin should be a directory containing a main.sh file."
+        return 0
+    fi
+
+    local plugin_count=0
+    local plugin_dir
+
+    for plugin_dir in "${plugins_dir}"/*/; do
+        [[ ! -d "${plugin_dir}" ]] && continue
+        local plugin_name
+        plugin_name="$(basename "${plugin_dir}")"
+        local plugin_main="${plugin_dir}main.sh"
+
+        if [[ -f "${plugin_main}" ]]; then
+            local plugin_desc=""
+            plugin_desc="$(grep -E '^(readonly )?PLUGIN_DESCRIPTION=' "${plugin_main}" 2>/dev/null | head -1 | sed 's/^readonly //' | cut -d= -f2- | tr -d '"' || true)"
+            print_success "${plugin_name}: ${plugin_desc:-No description}"
+            plugin_count=$((plugin_count + 1))
+        else
+            print_warning "${plugin_name}: missing main.sh"
+        fi
+    done
+
+    if [[ "${plugin_count}" -eq 0 ]]; then
+        echo "  No plugins installed."
+        echo ""
+        echo "  Plugins extend QYVORA Sentinel with additional capabilities."
+        echo "  Place plugin directories in: ${plugins_dir}/"
+    else
+        echo ""
+        echo "  Total plugins: ${plugin_count}"
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SUBCOMMAND: help
+# ---------------------------------------------------------------------------
+cmd_help() {
+    cat << 'HELPEOF'
+QYVORA Sentinel - Linux Security Auditing Framework
+
+Usage:
+  sentinel [global-options] <command> [command-options]
+
+Commands:
+  scan              Run all enabled scan modules
+  baseline [NAME]   Create a baseline snapshot (default: "default")
+  compare           Compare current state to last baseline
+  modules           List all available modules
+  report            Generate report from last scan results
+  doctor            Check system dependencies and configuration
+  version           Display version information
+  update            Check for updates
+  plugins           List/manage plugins
+  help              Display this help message
+
+Global Options:
+  -m, --module NAME     Run a specific module (repeatable)
+  -e, --exclude MODULE  Exclude a module (repeatable)
+  -I, --include MODULE  Include only these modules (repeatable)
+  -s, --severity LEVEL  Minimum severity (INFO|LOW|MEDIUM|HIGH|CRITICAL)
+  -o, --output FILE     Write output to file
+  -c, --config FILE     Use custom configuration file
+  -b, --baseline NAME   Baseline name for compare
+      --compare         Enable comparison mode
+  -t, --threads N       Number of parallel threads
+      --risk-score      Display risk score
+  -q, --quiet           Suppress non-essential output
+  -v, --verbose         Enable verbose output
+      --debug           Enable debug output (set -x)
+      --json            Output in JSON format
+      --html            Output in HTML format
+      --markdown        Output in Markdown format
+      --text            Output in text format (default)
+      --color           Force colored output
+      --no-color        Disable colored output
+  -h, --help            Show this help message
+  -V, --version         Show version information
+
+Examples:
+  sentinel scan
+  sentinel scan --module filesystem --module ssh
+  sentinel scan --severity medium --json --output report.json
+  sentinel scan --exclude malware --risk-score
+  sentinel baseline production
+  sentinel compare --baseline production
+  sentinel modules
+  sentinel report --html --output report.html
+  sentinel doctor
+  sentinel version
+
+Module Development:
+  Modules live in modules/<name>/main.sh and must export:
+
+    MODULE_NAME="mymodule"
+    MODULE_DESCRIPTION="What this module checks"
+    MODULE_SEVERITY_THRESHOLD="INFO"
+
+    run() {
+        # Your scan logic here
+        # Use add_finding MODULE "message" SEVERITY to record findings
+        add_finding "example" "Something concerning was found" "high"
+    }
+
+HELPEOF
+}
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+main() {
+    # If no arguments, show help
+    if [[ $# -eq 0 ]]; then
+        cmd_help
+        exit 0
+    fi
+
+    # Parse global options
+    SENTINEL_REMAINING_ARGS=""
+    parse_global_options "$@"
+
+    # Set up output mode based on parsed options
+    _setup_output_mode
+
+    # Split remaining args into subcommand and subcommand args
+    local subcommand=""
+    local subcommand_args=()
+
+    if [[ -n "${SENTINEL_REMAINING_ARGS}" ]]; then
+        subcommand="$(echo "${SENTINEL_REMAINING_ARGS}" | head -1)"
+        while IFS= read -r line; do
+            subcommand_args+=("${line}")
+        done < <(echo "${SENTINEL_REMAINING_ARGS}" | tail -n +2)
+    fi
+
+    # Dispatch to subcommand
+    case "${subcommand}" in
+        scan)
+            cmd_scan "${subcommand_args[@]+"${subcommand_args[@]}"}"
+            ;;
+        baseline)
+            cmd_baseline "${subcommand_args[@]+"${subcommand_args[@]}"}"
+            ;;
+        compare)
+            cmd_compare "${subcommand_args[@]+"${subcommand_args[@]}"}"
+            ;;
+        modules|module|list)
+            cmd_modules
+            ;;
+        report)
+            cmd_report "${subcommand_args[@]+"${subcommand_args[@]}"}"
+            ;;
+        doctor|check)
+            cmd_doctor
+            ;;
+        version|ver|-V)
+            cmd_version
+            ;;
+        update|upgrade)
+            cmd_update
+            ;;
+        plugins|plugin)
+            cmd_plugins "${subcommand_args[@]+"${subcommand_args[@]}"}"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        "")
+            cmd_help
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown command: ${subcommand}" >&2
+            echo "" >&2
+            echo "Run 'sentinel help' for usage information." >&2
+            exit 1
+            ;;
+    esac
+
+    return $?
+}
+
+main "$@"

@@ -1,0 +1,4 @@
+# ShellCheck configuration for QYVORA Sentinel
+
+# Disable: SC1091 - Not following sourced files
+disable=SC1091
