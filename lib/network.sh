@@ -88,10 +88,6 @@ detect_vpn() {
         local iface
         for iface in /sys/class/net/*; do
             iface="${iface##*/}"
-            local iface_type=""
-            if [[ -f "/sys/class/net/${iface}/type" ]]; then
-                iface_type="$(cat "/sys/class/net/${iface}/type" 2>/dev/null || echo "")"
-            fi
             if [[ "${iface}" == tun* || "${iface}" == tap* || "${iface}" == wg* || "${iface}" == ppp* ]]; then
                 echo "VPN interface detected: ${iface}"
                 found=1

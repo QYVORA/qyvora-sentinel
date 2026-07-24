@@ -26,6 +26,7 @@ FIXTURE_DIR=$(mktemp -d -t "sentinel_hash_test.XXXXXX")
 echo "Hello, QYVORA Sentinel!" > "${FIXTURE_DIR}/testfile.txt"
 
 # Pre-computed expected hashes for "Hello, QYVORA Sentinel!\n"
+# shellcheck disable=SC2034
 EXPECTED_MD5="c3e80e5837e3c8f5772b570d7be2852f"
 EXPECTED_SHA1="b737e98ef5e69ab05f57be2de1b8c8c65e29e020"
 EXPECTED_SHA256="4e9b3f1d8a3c0e5f6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9"

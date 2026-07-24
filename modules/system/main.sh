@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="system"
 readonly MODULE_DESCRIPTION="System information and configuration audit"
 readonly MODULE_VERSION="1.0.0"

@@ -174,6 +174,7 @@ safe_find() {
                 local skip=0
                 local pattern
                 for pattern in "${ignore_patterns[@]}"; do
+                    # shellcheck disable=SC2053
                     if [[ "${line}" == ${pattern} ]]; then
                         skip=1
                         break

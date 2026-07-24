@@ -17,6 +17,7 @@ source "${LIB_DIR}/reporting.sh"
 
 MODULE_NAME="browser"
 MODULE_DESCRIPTION="Browser artifact audit"
+# shellcheck disable=SC2034
 MODULE_VERSION="1.0.0"
 MODULE_SEVERITY_THRESHOLD="low"
 

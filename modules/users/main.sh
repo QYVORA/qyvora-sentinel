@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="users"
 readonly MODULE_DESCRIPTION="User account and privilege audit"
 readonly MODULE_VERSION="1.0.0"
@@ -348,7 +349,7 @@ _user_cron_entries() {
 
     local found=false
 
-    while IFS=: read -r username _ uid _ _ homedir shell; do
+    while IFS=: read -r username _ _ _ _ homedir shell; do
         [[ -z "${homedir}" ]] || [[ ! -d "${homedir}" ]] && continue
 
         local cron_output

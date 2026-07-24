@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="permissions"
 readonly MODULE_DESCRIPTION="File and directory permission audit"
 readonly MODULE_VERSION="1.0.0"
@@ -250,7 +251,7 @@ _world_writable_in_path() {
     local found_issue=false
     local IFS_BAK="${IFS}"
     IFS=':'
-    local -a path_dirs=(${PATH})
+    local -a path_dirs; read -ra path_dirs <<< "${PATH}"
     IFS="${IFS_BAK}"
 
     local dir

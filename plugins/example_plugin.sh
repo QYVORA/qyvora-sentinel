@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# shellcheck disable=SC2034
 PLUGIN_NAME="example"
 PLUGIN_VERSION="1.0.0"
 PLUGIN_AUTHOR="QYVORA Project"

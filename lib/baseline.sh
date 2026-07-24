@@ -52,6 +52,7 @@ baseline_init() {
 
 # --- Capture Functions ---
 
+# shellcheck disable=SC2120
 baseline_capture_file_hashes() {
     local -r dirs="${1:-/etc /usr/bin /usr/sbin /bin /sbin}"
     local -a target_dirs
@@ -94,7 +95,7 @@ baseline_capture_services() {
 
 baseline_capture_users() {
     if [[ -f /etc/passwd ]]; then
-        while IFS=: read -r username _ uid gid gecos home shell; do
+        while IFS=: read -r username _ uid gid _ home shell; do
             printf 'USER|%s|%s|%s|%s|%s\n' "${username}" "${uid}" "${gid}" "${home}" "${shell}"
         done < /etc/passwd
     fi

@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="kernel"
 readonly MODULE_DESCRIPTION="Kernel and module security audit"
 readonly MODULE_VERSION="1.0.0"
@@ -75,7 +76,7 @@ _kernel_version_check() {
     if [[ "${kernel_version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
         major="${BASH_REMATCH[1]}"
         minor="${BASH_REMATCH[2]}"
-        patch="${BASH_REMATCH[3]}"
+        _="${BASH_REMATCH[3]}"
 
         if [[ "${major}" -lt 5 ]]; then
             add_finding "kernel" "Kernel is end-of-life (EOL): ${kernel_version}" "high" \
@@ -238,7 +239,7 @@ _kernel_taint() {
             print_success "Kernel is not tainted"
         else
             add_finding "kernel" "Kernel is tainted (value: ${taint_value})" "medium" \
-                "tainted=${tainted_value}" \
+                "tainted=${taint_value}" \
                 "Investigate kernel taint causes."
             print_warning "Kernel is tainted (value: ${taint_value})"
 

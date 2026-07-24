@@ -294,8 +294,8 @@ _report_print_severity_breakdown() {
 
 # --- Report Sections ---
 
+# shellcheck disable=SC2120
 report_executive_summary() {
-    local -r findings_file="${1}"
     local risk_score
     risk_score="$(calculate_risk_score)"
 
@@ -328,6 +328,7 @@ report_system_overview() {
     echo "================================================================"
 }
 
+# shellcheck disable=SC2120
 report_recommendations() {
     local -r output="${1:-/dev/stdout}"
     local critical_count=0 high_count=0 medium_count=0 low_count=0 info_count=0

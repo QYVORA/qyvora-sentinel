@@ -46,7 +46,6 @@ check_required() {
         errors=$((errors + 1))
     fi
 
-    # shellcheck
     if command -v shellcheck &>/dev/null; then
         pass "shellcheck $(shellcheck --version | grep 'version:' | awk '{print $2}')"
     else

@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="kubernetes"
 readonly MODULE_DESCRIPTION="Kubernetes security audit"
 readonly MODULE_VERSION="1.0.0"
@@ -131,8 +132,8 @@ _privileged_pods() {
         [[ -z "${line}" ]] && continue
 
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
 
         local containers
         containers=$(echo "${line}" | jq -c '.spec.containers[]?.securityContext.privileged // false' 2>/dev/null || true)
@@ -180,8 +181,8 @@ _root_pods() {
         [[ -z "${line}" ]] && continue
 
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
 
         local run_as_non_root
         run_as_non_root=$(echo "${line}" | jq -r '.spec.containers[]?.securityContext.runAsNonRoot // false' 2>/dev/null || echo "false")
@@ -226,8 +227,8 @@ _host_pid_network_ipc() {
         [[ -z "${line}" ]] && continue
 
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
 
         local host_pid host_network host_ipc
         host_pid=$(echo "${line}" | jq -r '.spec.hostPID // false' 2>/dev/null || echo "false")
@@ -290,8 +291,8 @@ _host_path_mounts() {
         [[ -z "${line}" ]] && continue
 
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
 
         local host_paths
         host_paths=$(echo "${line}" | jq -r '.spec.volumes[]?.hostPath.path // empty' 2>/dev/null || true)
@@ -389,8 +390,8 @@ _service_account_token() {
         [[ -z "${line}" ]] && continue
 
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
 
         local automount
         automount=$(echo "${line}" | jq -r '.spec.automountServiceAccountToken // true' 2>/dev/null || echo "true")
@@ -437,8 +438,8 @@ _dangerous_capabilities() {
         [[ -z "${line}" ]] && continue
 
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
 
         local adds
         adds=$(echo "${line}" | jq -c '.spec.containers[]?.securityContext.capabilities.add[]? // empty' 2>/dev/null || true)
@@ -495,8 +496,8 @@ _secrets_check() {
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
         local ns name
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
         print_finding "info" "  ${ns}/${name}"
     done <<< "$(echo "${secrets}" | jq -c '.items[]' 2>/dev/null)"
 }
@@ -594,8 +595,8 @@ _exposed_services() {
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
         local ns name stype
-        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null || continue)
-        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null || continue)
+        ns=$(echo "${line}" | jq -r '.metadata.namespace' 2>/dev/null) || continue
+        name=$(echo "${line}" | jq -r '.metadata.name' 2>/dev/null) || continue
         stype=$(echo "${line}" | jq -r '.spec.type' 2>/dev/null || echo "unknown")
 
         if [[ "${stype}" == "LoadBalancer" || "${stype}" == "NodePort" ]]; then

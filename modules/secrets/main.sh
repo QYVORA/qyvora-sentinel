@@ -17,6 +17,7 @@ source "${LIB_DIR}/reporting.sh"
 
 MODULE_NAME="secrets"
 MODULE_DESCRIPTION="Secrets and credential discovery"
+# shellcheck disable=SC2034
 MODULE_VERSION="1.0.0"
 MODULE_SEVERITY_THRESHOLD="medium"
 
@@ -137,7 +138,7 @@ check_azure_credentials() {
     if [[ -n "${azure_files}" ]]; then
         while IFS= read -r azure_file; do
             local basename
-            basename=$(basename "${azure_file}" 2>/dev/null || continue)
+            basename=$(basename "${azure_file}" 2>/dev/null) || continue
 
             if [[ "${basename}" =~ (credentials|profile|config|token) ]]; then
                 local content
@@ -164,7 +165,7 @@ check_gcp_credentials() {
     if [[ -n "${gcp_creds}" ]]; then
         while IFS= read -r gcp_file; do
             local basename
-            basename=$(basename "${gcp_file}" 2>/dev/null || continue)
+            basename=$(basename "${gcp_file}" 2>/dev/null) || continue
 
             if [[ "${basename}" =~ (application_default_credentials|credentials.db|access_tokens) ]]; then
                 add_finding "${MODULE_NAME}" "GCP credentials file" "critical" \
@@ -286,11 +287,11 @@ check_ssh_keys() {
             while IFS= read -r keyfile; do
                 [[ -f "${keyfile}" ]] || continue
                 local first_line
-                first_line=$(head -1 "${keyfile}" 2>/dev/null || continue)
+                first_line=$(head -1 "${keyfile}" 2>/dev/null) || continue
 
                 if [[ "${first_line}" =~ PRIVATE || "${first_line}" =~ "BEGIN" ]]; then
                     local basename
-                    basename=$(basename "${keyfile}" 2>/dev/null || continue)
+                    basename=$(basename "${keyfile}" 2>/dev/null) || continue
 
                     if [[ "${basename}" != "${key_name}"* ]]; then
                         add_finding "${MODULE_NAME}" "SSH key file" "high" \
@@ -324,11 +325,11 @@ check_api_keys_in_configs() {
         if [[ -n "${found}" ]]; then
             while IFS= read -r match; do
                 local file
-                file=$(echo "${match}" | cut -d: -f1 2>/dev/null || continue)
+                file=$(echo "${match}" | cut -d: -f1 2>/dev/null) || continue
 
                 if [[ -f "${file}" ]]; then
                     local basename
-                    basename=$(basename "${file}" 2>/dev/null || continue)
+                    basename=$(basename "${file}" 2>/dev/null) || continue
 
                     if [[ ! "${basename}" =~ (README|LICENSE|CHANGELOG|\.md$) ]]; then
                         add_finding "${MODULE_NAME}" "API key in configuration" "high" \
@@ -368,7 +369,7 @@ check_kubernetes_secrets() {
     print_header "Checking Kubernetes Secrets"
 
     local k8s_secrets
-    k8s_secrets=$(find /home /root /srv /opt -name "*.yaml" -o -name "*.yml" 2>/dev/null | \
+    k8s_secrets=$(find /home /root /srv /opt \( -name "*.yaml" -o -name "*.yml" \) -print0 2>/dev/null | tr '\0' '\n' | \
         xargs grep -l "kind:\s*Secret" 2>/dev/null || true)
 
     if [[ -n "${k8s_secrets}" ]]; then
@@ -416,7 +417,7 @@ check_hardcoded_passwords() {
         if [[ -n "${found}" ]]; then
             while IFS= read -r match; do
                 local file
-                file=$(echo "${match}" | cut -d: -f1 2>/dev/null || continue)
+                file=$(echo "${match}" | cut -d: -f1 2>/dev/null) || continue
 
                 if [[ -f "${file}" ]]; then
                     local ext
@@ -443,7 +444,7 @@ check_private_key_files() {
         if [[ -n "${key_files}" ]]; then
             while IFS= read -r keyfile; do
                 local content
-                content=$(head -5 "${keyfile}" 2>/dev/null || continue)
+                content=$(head -5 "${keyfile}" 2>/dev/null) || continue
 
                 if [[ "${content}" =~ "PRIVATE KEY" || "${content}" =~ "PRIVATE" ]]; then
                     add_finding "${MODULE_NAME}" "Private key file" "critical" \
@@ -481,7 +482,7 @@ check_database_connection_strings() {
         if [[ -n "${found}" ]]; then
             while IFS= read -r match; do
                 local file
-                file=$(echo "${match}" | cut -d: -f1 2>/dev/null || continue)
+                file=$(echo "${match}" | cut -d: -f1 2>/dev/null) || continue
 
                 if [[ -f "${file}" ]]; then
                     add_finding "${MODULE_NAME}" "Database connection string" "high" \
@@ -506,7 +507,7 @@ check_jwt_tokens() {
     if [[ -n "${found}" ]]; then
         while IFS= read -r match; do
             local file
-            file=$(echo "${match}" | cut -d: -f1 2>/dev/null || continue)
+            file=$(echo "${match}" | cut -d: -f1 2>/dev/null) || continue
 
             if [[ -f "${file}" ]]; then
                 local ext

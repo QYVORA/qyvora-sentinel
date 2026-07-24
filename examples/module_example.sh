@@ -19,6 +19,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="example"
 readonly MODULE_DESCRIPTION="Example module template"
 readonly MODULE_VERSION="0.1.0"

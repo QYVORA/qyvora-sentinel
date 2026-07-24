@@ -43,6 +43,7 @@ color = off
 EOF
 
 # Reset config state
+# shellcheck disable=SC2034
 SENTINEL_CONFIG=()
 
 # --- config_load ---

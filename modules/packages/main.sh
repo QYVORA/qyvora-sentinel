@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="packages"
 readonly MODULE_DESCRIPTION="Package management security audit"
 readonly MODULE_VERSION="1.0.0"

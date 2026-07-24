@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="timeline"
 readonly MODULE_DESCRIPTION="System timeline and event analysis"
 readonly MODULE_VERSION="1.0.0"
@@ -171,7 +172,7 @@ _file_modifications() {
         find /usr/bin /usr/sbin /usr/local/bin -type f -mtime -7 2>/dev/null | head -50 || echo "N/A"
         echo ""
         echo "=== Recently Modified Config Files (last 24h) ==="
-        find /etc -name "*.conf" -o -name "*.cfg" -o -name "*.ini" 2>/dev/null | xargs ls -lt 2>/dev/null | head -30 || echo "N/A"
+        find /etc \( -name "*.conf" -o -name "*.cfg" -o -name "*.ini" \) -print0 2>/dev/null | xargs -0 ls -lt 2>/dev/null | head -30 || echo "N/A"
     } > "${file_mod_file}"
 
     add_finding "${MODULE_NAME}" "INFO" \

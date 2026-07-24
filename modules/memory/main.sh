@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="memory"
 readonly MODULE_DESCRIPTION="Memory and process analysis"
 readonly MODULE_VERSION="1.0.0"
@@ -54,7 +55,7 @@ _excessive_memory_processes() {
     local line
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
-        local pid user mem pct rss comm
+        local pid user mem _ rss comm
         pid="$(echo "${line}" | awk '{print $1}')"
         user="$(echo "${line}" | awk '{print $2}')"
         mem="$(echo "${line}" | awk '{print $3}')"
@@ -142,7 +143,8 @@ _suspicious_shared_memory() {
                 size="$(echo "${segment}" | awk '{print $5}')"
 
                 if [[ -n "${perms}" && "${perms}" != "0000" ]]; then
-                    local perms_dec=$(( 8#${perms} 2>/dev/null || echo 0 ))
+                    local perms_dec
+                    perms_dec=$(( 8#${perms} )) 2>/dev/null || perms_dec=0
                     if [[ $(( perms_dec & 8#0002 )) -ne 0 ]]; then
                         add_finding "${MODULE_NAME}" "MEDIUM" \
                             "World-writable shared memory segment" \
@@ -234,12 +236,10 @@ _meminfo_analysis() {
         return
     fi
 
-    local mem_total mem_free mem_available buffers cached
+    local mem_total mem_free mem_available
     mem_total="$(grep '^MemTotal:' /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")"
     mem_free="$(grep '^MemFree:' /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")"
     mem_available="$(grep '^MemAvailable:' /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")"
-    buffers="$(grep '^Buffers:' /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")"
-    cached="$(grep '^Cached:' /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")"
 
     local total_mb=$(( mem_total / 1024 ))
     local free_mb=$(( mem_free / 1024 ))
@@ -346,7 +346,7 @@ _process_injection_indicators() {
         [[ ! -f "/proc/${pid}/maps" ]] && continue
 
         local comm
-        comm="$(cat "/proc/${pid}/comm" 2>/dev/null || continue)"
+        comm="$(cat "/proc/${pid}/comm" 2>/dev/null)" || continue
 
         local anon_exec_count
         anon_exec_count="$(grep -c "rwxp" "/proc/${pid}/maps" 2>/dev/null || echo "0")"

@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="docker"
 readonly MODULE_DESCRIPTION="Docker security audit"
 readonly MODULE_VERSION="1.0.0"

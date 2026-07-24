@@ -206,12 +206,12 @@ plugin_unload() {
 
     # Note: We cannot truly 'unload' a sourced bash function, but we can
     # remove it from tracking and mark it as disabled.
-    unset SENTINEL_PLUGIN_NAMES["${plugin_name}"]
-    unset SENTINEL_PLUGIN_PATHS["${plugin_name}"]
-    unset SENTINEL_PLUGIN_VERSIONS["${plugin_name}"]
-    unset SENTINEL_PLUGIN_AUTHORS["${plugin_name}"]
-    unset SENTINEL_PLUGIN_DESCRIPTIONS["${plugin_name}"]
-    unset SENTINEL_PLUGIN_ENABLED["${plugin_name}"]
+    unset "SENTINEL_PLUGIN_NAMES[${plugin_name}]"
+    unset "SENTINEL_PLUGIN_PATHS[${plugin_name}]"
+    unset "SENTINEL_PLUGIN_VERSIONS[${plugin_name}]"
+    unset "SENTINEL_PLUGIN_AUTHORS[${plugin_name}]"
+    unset "SENTINEL_PLUGIN_DESCRIPTIONS[${plugin_name}]"
+    unset "SENTINEL_PLUGIN_ENABLED[${plugin_name}]"
 
     # Remove from loaded plugins array
     local -a new_loaded=()

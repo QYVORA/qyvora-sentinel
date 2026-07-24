@@ -4,7 +4,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly INSTALLER_VERSION="1.0.0"
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR; SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default installation paths
 PREFIX="${PREFIX:-/usr/local}"

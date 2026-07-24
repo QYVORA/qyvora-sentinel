@@ -17,6 +17,7 @@ source "${LIB_DIR}/reporting.sh"
 
 MODULE_NAME="crypto"
 MODULE_DESCRIPTION="Cryptocurrency mining detection"
+# shellcheck disable=SC2034
 MODULE_VERSION="1.0.0"
 MODULE_SEVERITY_THRESHOLD="medium"
 
@@ -124,7 +125,7 @@ search_wallet_files() {
         if [[ -n "${dat_files}" ]]; then
             while IFS= read -r datfile; do
                 local basename
-                basename=$(basename "${datfile}" 2>/dev/null || continue)
+                basename=$(basename "${datfile}" 2>/dev/null) || continue
                 if [[ "${basename}" =~ (wallet|crypto|bitcoin|monero|ethereum|blockchain) ]]; then
                     add_finding "${MODULE_NAME}" "Cryptocurrency data file" "high" \
                         "Potential crypto data file: ${datfile}" "${datfile}"
@@ -185,7 +186,7 @@ check_mining_processes() {
     if [[ -n "${hidden_procs}" ]]; then
         while IFS= read -r proc; do
             local proc_name
-            proc_name=$(echo "${proc}" | awk '{print $NF}' 2>/dev/null || continue)
+            proc_name=$(echo "${proc}" | awk '{print $NF}' 2>/dev/null) || continue
             if [[ "${proc_name}" =~ (xmr|mine|coin|crypto|strat) ]]; then
                 add_finding "${MODULE_NAME}" "Hidden mining process" "critical" \
                     "Possible hidden mining process: ${proc}" ""
@@ -267,8 +268,8 @@ check_cpu_usage() {
     if [[ -n "${high_cpu}" ]]; then
         while IFS= read -r line; do
             local proc_name cpu_usage
-            proc_name=$(echo "${line}" | awk '{print $11}' 2>/dev/null || continue)
-            cpu_usage=$(echo "${line}" | awk '{print $3}' 2>/dev/null || continue)
+            proc_name=$(echo "${line}" | awk '{print $11}' 2>/dev/null) || continue
+            cpu_usage=$(echo "${line}" | awk '{print $3}' 2>/dev/null) || continue
 
             local suspicious=0
             for miner in xmrig minerd cpuminer; do
@@ -333,18 +334,18 @@ check_hidden_processes() {
 
     while IFS= read -r line; do
         local proc_path
-        proc_path=$(echo "${line}" | awk '{print $11}' 2>/dev/null || continue)
+        proc_path=$(echo "${line}" | awk '{print $11}' 2>/dev/null) || continue
 
         if [[ -z "${proc_path}" || "${proc_path}" =~ ^\[.*\]$ ]]; then
             continue
         fi
 
         local basename
-        basename=$(basename "${proc_path}" 2>/dev/null || continue)
+        basename=$(basename "${proc_path}" 2>/dev/null) || continue
 
         if [[ -f "/proc/${line%% *}/exe" ]]; then
             local real_path
-            real_path=$(readlink -f "/proc/${line%% *}/exe" 2>/dev/null || continue)
+            real_path=$(readlink -f "/proc/${line%% *}/exe" 2>/dev/null) || continue
 
             if [[ "${real_path}" != "${proc_path}" && ! "${real_path}" =~ (system|usr|lib) ]]; then
                 add_finding "${MODULE_NAME}" "Process path mismatch" "high" \
@@ -367,8 +368,8 @@ check_mining_connections() {
 
     while IFS= read -r conn; do
         local remote_port remote_addr
-        remote_port=$(echo "${conn}" | awk '{print $5}' | rev | cut -d: -f1 | rev 2>/dev/null || continue)
-        remote_addr=$(echo "${conn}" | awk '{print $5}' | rev | cut -d: -f2- | rev 2>/dev/null || continue)
+        remote_port=$(echo "${conn}" | awk '{print $5}' | rev | cut -d: -f1 | rev 2>/dev/null) || continue
+        remote_addr=$(echo "${conn}" | awk '{print $5}' | rev | cut -d: -f2- | rev 2>/dev/null) || continue
 
         if [[ -v "KNOWN_MINING_PORTS[${remote_port}]" ]]; then
             add_finding "${MODULE_NAME}" "Connection on mining port" "high" \
@@ -486,9 +487,9 @@ find_hidden_processes() {
     ps aux 2>/dev/null | awk '{print $2}' | while read -r pid; do
         if [[ -d "/proc/${pid}" && -L "/proc/${pid}/exe" ]]; then
             local exe_path
-            exe_path=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || continue)
+            exe_path=$(readlink -f "/proc/${pid}/exe" 2>/dev/null) || continue
             local cmdline
-            cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || continue)
+            cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null) || continue
             if [[ -n "${cmdline}" ]]; then
                 echo "${cmdline}"
             fi

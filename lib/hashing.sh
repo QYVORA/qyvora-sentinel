@@ -15,10 +15,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/logger.sh"
 
 # Detect available hash commands
-readonly SENTINEL_SHA256_CMD="$(_detect_hash_cmd sha256sum shasum -a 256)"
-readonly SENTINEL_SHA1_CMD="$(_detect_hash_cmd sha1sum shasum -a 1)"
-readonly SENTINEL_SHA512_CMD="$(_detect_hash_cmd sha512sum shasum -a 512)"
-readonly SENTINEL_MD5_CMD="$(_detect_hash_cmd md5sum md5)"
+readonly SENTINEL_SHA256_CMD; SENTINEL_SHA256_CMD="$(_detect_hash_cmd sha256sum shasum -a 256)"
+readonly SENTINEL_SHA1_CMD; SENTINEL_SHA1_CMD="$(_detect_hash_cmd sha1sum shasum -a 1)"
+readonly SENTINEL_SHA512_CMD; SENTINEL_SHA512_CMD="$(_detect_hash_cmd sha512sum shasum -a 512)"
+readonly SENTINEL_MD5_CMD; SENTINEL_MD5_CMD="$(_detect_hash_cmd md5sum md5)"
 
 _detect_hash_cmd() {
     local cmd

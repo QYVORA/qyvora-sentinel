@@ -10,6 +10,7 @@ source "${SCRIPT_DIR}/../unit/test_framework.sh"
 
 test_suite "Sentinel CLI Integration"
 
+# shellcheck disable=SC2034
 SENTINEL="${PROJECT_ROOT}/sentinel"
 
 # --- sentinel --help ---

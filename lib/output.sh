@@ -140,6 +140,7 @@ print_info() {
 }
 
 # print_separator - Print a horizontal line
+# shellcheck disable=SC2120
 print_separator() {
     local width="${1:-60}"
     printf '%*s\n' "${width}" '' | tr ' ' '─'

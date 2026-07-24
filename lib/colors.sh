@@ -25,6 +25,7 @@ readonly SENTINEL_COLOR_DIM='\033[2m'
 readonly SENTINEL_COLOR_RESET='\033[0m'
 
 # Sentinel-specific aliases
+# shellcheck disable=SC2034
 readonly SENTINEL_CLR_BLACK="${SENTINEL_COLOR_BLACK}"
 readonly SENTINEL_CLR_RED="${SENTINEL_COLOR_RED}"
 readonly SENTINEL_CLR_GREEN="${SENTINEL_COLOR_GREEN}"
@@ -151,7 +152,7 @@ severity_color() {
         low|info|informational)
             printf '%s' "${SENTINEL_COLOR_GREEN}"
             ;;
-        none|info|pass|ok)
+        none|pass|ok)
             printf '%s' "${SENTINEL_COLOR_GREEN}"
             ;;
         debug|trace)

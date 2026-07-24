@@ -15,6 +15,7 @@ source "${LIB_DIR}/network.sh"
 source "${LIB_DIR}/process.sh"
 source "${LIB_DIR}/reporting.sh"
 
+# shellcheck disable=SC2034
 readonly MODULE_NAME="ssh"
 readonly MODULE_DESCRIPTION="SSH configuration audit"
 readonly MODULE_VERSION="1.0.0"
@@ -195,7 +196,7 @@ _weak_algorithms() {
 
     local found_weak=false
 
-    for config_file in "${SSHD_CONFIG}"; do
+    for config_file in ${SSHD_CONFIG}; do
         [[ -f "${config_file}" ]] || continue
 
         local ciphers_line
@@ -391,7 +392,7 @@ _key_file_permissions() {
 
     local found=false
 
-    while IFS=: read -r username _ uid _ _ homedir shell; do
+    while IFS=: read -r username _ _ _ _ homedir _; do
         [[ -z "${homedir}" ]] || [[ ! -d "${homedir}" ]] && continue
         [[ ! -d "${homedir}/.ssh" ]] && continue
 
